@@ -1,0 +1,32 @@
+---
+# Name of the metric. Will be exposed as query_result_num_products
+- step: 1
+  # Help text for step1
+  help: Products belonging to category ID 5
+
+  # SQL string. Parameters are name-based (not positional) and must be
+  # prefixed with a colon. See `:category_id` in the query below for an example.
+  # Must return single row, single column
+  sql: >
+      select count(product_id)
+      from product
+          inner join product_category
+              on (product.category_id = product_category.id)
+          inner join product_category_idx
+              on (product_category.id = product_category_idx.category_id)
+      where (product_category_idx.category_id = :category_id
+          or product_category_idx.ancestor_category_id = :category_id )
+      and product_category.name = :category_name
+  # Parameter values by name.
+  params:
+      category_id: 5
+      category_name: "merch"
+  # For faceted metrics provide the name of the metric-column in config, and return a resultset of multiple columns and rows
+- step: 2
+  # Help text seen for metrics exposed
+  help: Number of sales by country  
+  sql: >
+      select country, count(1) as cnt from sales  
+  # Parameter values by name.
+  
+        
