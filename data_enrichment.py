@@ -850,4 +850,207 @@ df_prep = spark_manager.run_spark_sql_pipeline(
 df_prep.show(5, truncate=False)
 
 
+
+# RDBMS ingestion function
+def init_spark(config, app=None, use_session=False):
+    import os
+    import sys
+    from glob import glob
+
+    if 'spark-home' in config:
+        os.environ['SPARK_HOME'] = config['spark-home']
+
+    if 'spark-conf-dir' in config:
+        os.environ['SPARK_CONF_DIR'] = config['spark-conf-dir']
+
+    if 'pyspark-python' in config:
+        # Set python interpreter on both driver and workers
+        os.environ['PYSPARK_PYTHON'] = config['pyspark-python']
+
+    if 'yarn-conf-dir' in config:
+        # Hadoop YARN configuration
+        os.environ['YARN_CONF_DIR'] = config['yarn-conf-dir']
+
+    if 'spark-classpath' in config:
+        # can be used to set external folder with Hive configuration
+        # e. g. spark-classpath='/etc/hive/conf.cloudera.hive1'
+        os.environ['SPARK_CLASSPATH'] = config['spark-classpath']
+
+    submit_args = []
+
+    driver_mem = config.get('spark-prop.spark.driver.memory', None)
+    if driver_mem is not None:
+        submit_args.extend(["--driver-memory", driver_mem])
+
+    driver_cp = config.get('spark-prop.spark.driver.extraClassPath', None)
+    if driver_cp is not None:
+        submit_args.extend(["--driver-class-path", driver_cp])
+
+    driver_java_opt = config.get('spark-prop.spark.driver.extraJavaOptions', None)
+    if driver_java_opt is not None:
+        submit_args.extend(["--driver-java-options", driver_java_opt])
+
+    jars = config.get('jars', None)
+    if jars is not None:
+        if isinstance(jars, str):
+            jars = [jars]
+        submit_args.extend(["--jars", ','.join(jars)])
+
+    mode_yarn = config['spark-prop.spark.master'].startswith('yarn')
+
+    if mode_yarn:
+        # pyspark .zip distribution flag is set only if spark-submit have master=yarn in command-line arguments
+        # see spark.yarn.isPython conf property setting code
+        # in org.apache.spark.deploy.SparkSubmit#prepareSubmitEnvironment
+        submit_args.extend(['--master', 'yarn'])
+
+    # pyspark .zip distribution flag is set only if spark-submit have pyspark-shell or .py as positional argument
+    # see spark.yarn.isPython conf property setting code
+    # in org.apache.spark.deploy.SparkSubmit#prepareSubmitEnvironment
+    submit_args.append('pyspark-shell')
+
+    os.environ['PYSPARK_SUBMIT_ARGS'] = ' '.join(submit_args)
+
+    spark_home = os.environ['SPARK_HOME']
+    spark_python = os.path.join(spark_home, 'python')
+    pyspark_libs = glob(os.path.join(spark_python, 'lib', '*.zip'))
+    sys.path.extend(pyspark_libs)
+
+    virtualenv_reqs = config['spark-prop'].get('spark.pyspark.virtualenv.requirements', None)
+    if use_session:
+        from pyspark.sql import SparkSession
+
+        builder = SparkSession.builder.appName(app or config['app'])
+
+        if mode_yarn:
+            builder = builder.enableHiveSupport()
+
+        for k, v in prop_list(config['spark-prop']).items():
+            builder = builder.config(k, v)
+
+        ss = builder.getOrCreate()
+        if virtualenv_reqs is not None:
+            ss.addFile(virtualenv_reqs)
+        return ss
+    else:
+        from pyspark import SparkConf, SparkContext
+        conf = SparkConf()
+        conf.setAppName(app or config['app'])
+        props = [(k, str(v)) for k, v in prop_list(config['spark-prop']).items()]
+        conf.setAll(props)
+        sc = SparkContext(conf=conf)
+        if virtualenv_reqs is not None:
+            sc.addFile(virtualenv_reqs)
+        return sc
+
+
+def init_session(config, app=None, return_context=False, overrides=None, use_session=False):
+    import os
+    from pyhocon import ConfigFactory, ConfigParser
+
+    if isinstance(config, str):
+        if os.path.exists(config):
+            base_conf = ConfigFactory.parse_file(config, resolve=False)
+        else:
+            base_conf = ConfigFactory.parse_string(config, resolve=False)
+    elif isinstance(config, dict):
+        base_conf = ConfigFactory.from_dict(config)
+    else:
+        base_conf = config
+
+    if overrides is not None:
+        over_conf = ConfigFactory.parse_string(overrides)
+        conf = over_conf.with_fallback(base_conf)
+    else:
+        conf = base_conf
+        ConfigParser.resolve_substitutions(conf)
+
+    res = init_spark(conf, app, use_session)
+
+    if use_session:
+        return res
+    else:
+        mode_yarn = conf['spark-prop.spark.master'].startswith('yarn')
+
+        if mode_yarn:
+            from pyspark.sql import HiveContext
+            sqc = HiveContext(res)
+
+            if 'hive-prop' in conf:
+                for k, v in prop_list(conf['hive-prop']).items():
+                    sqc.setConf(k, str(v))
+        else:
+            from pyspark.sql import SQLContext
+            sqc = SQLContext(res)
+
+        if return_context:
+            return res, sqc
+        else:
+            return sqc
+        
+def jdbc_load(
+    sqc,
+    query,
+    conn_params,
+    partition_column=None,
+    num_partitions=10,
+    lower_bound=None,
+    upper_bound=None,fetch_size=10000000
+):
+    import re
+    if re.match(r'\s*\(.+\)\s+as\s+\w+\s*', query):
+        _query = query
+    else:
+        _query = '({}) as a'.format(query)
+
+    conn_params_base = dict(conn_params)
+    if partition_column and num_partitions and num_partitions > 1:
+        if lower_bound is None or upper_bound is None:
+            min_max_query = '''
+              (select max({part_col}) as max_part, min({part_col}) as min_part
+                 from {query}) as g'''.format(part_col=partition_column, query=_query)
+            max_min_df = sqc.read.load(dbtable=min_max_query, **conn_params_base)
+            tuples = max_min_df.rdd.collect()
+            lower_bound = str(tuples[0].max_part)
+            upper_bound = str(tuples[0].min_part)
+        conn_params_base['fetchSize'] = str(fetch_size)
+        conn_params_base['partitionColumn'] = partition_column
+        conn_params_base['lowerBound'] = lower_bound
+        conn_params_base['upperBound'] = upper_bound
+        conn_params_base['numPartitions'] = str(num_partitions)
+    sdf = sqc.read.load(dbtable=_query, **conn_params_base)
+    return sdf
+
+def partition_iterator(sdf):
+    import pyspark.sql.functions as F
+    sdf_part = sdf.withColumn('partition', F.spark_partition_id())
+    sdf_part.cache()
+    for part in range(sdf.rdd.getNumPartitions()):
+        yield sdf_part.where(F.col('partition') == part).drop('partition').rdd.toLocalIterator()
+
+def proportion_samples(sdf, proportions_sdf, count_column='rows_count'):
+    '''Load huge tables from Hive slightly faster than over toPandas in Spark
+    Parameters
+    ----------
+    sdf : spark Dataframe to sample from
+    proportions_sdf : spark Dataframe with counts to sample from sdf
+    count_column: column name with counts, other columns used as statifiers
+ 
+    Returns
+    ----------
+    sampled : spark Dataframe with number of rows lesser or equal proportions_sdf for each strata
+    '''
+    import pyspark.sql.functions as F
+    from pyspark.sql.window import Window
+    groupers = [c for c in proportions_sdf.columns if c != count_column]
+
+    sampled = sdf.join(proportions_sdf, groupers, how='inner').withColumn(
+        'rownum',
+        F.rowNumber().over(Window.partitionBy(groupers))
+    ).filter(
+        F.col('rownum') <= F.col(count_column)
+    ).drop(count_column).drop('rownum')
+    return sampled
+
+
 '''
